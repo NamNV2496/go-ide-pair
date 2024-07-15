@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Save Username to Session Storage</title>
+</head>
+<body>
+    <h2>Enter Your Username</h2>
+    <input type="text" id="usernameInput" placeholder="Enter your username...">
+    <button onclick="saveUsername()">Save Username</button>
+
+    <script>
+        function saveUsername() {
+            const username = document.getElementById('usernameInput').value;
+            if (username.trim() === '') {
+                alert('Please enter a valid username.');
+                return;
+            }
+
+            // Save username to sessionStorage
+            sessionStorage.setItem('userName', username);
+            // Optionally, redirect or perform other actions after saving
+            window.location.href = 'coding.html';
+        }
+    </script>
+</body>
+</html>

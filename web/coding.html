@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Shared Editor</title>
+    <style>
+        #editor {
+            width: 100%;
+            height: 500px;
+            border: 1px solid #ccc;
+        }
+        #input, #result {
+            width: 100%;
+            height: 100px;
+            border: 1px solid #ccc;
+            font-family: monospace;
+            font-size: 16px;
+            overflow: auto;
+            background-color: #f5f5f5;
+            white-space: pre-wrap; /* Preserve whitespace and line breaks */
+        }
+        #connect, #logout, #submit {
+            padding: 10px;
+            font-size: 16px;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.12/ace.js"></script>
+</head>
+<body>
+
+    <button id="connect" type="button" onclick="HandleWS()">Share</button>
+    <button id="logout" type="button">Logout</button>
+    <h1>Shared Editor</h1>
+    <div></div>
+    <button id="submit" type="button" onclick="Submit()" >Submit</button>
+    
+    <div id="editor">
+nums = [1,5,2,7,9]
+def findMax():
+    max = nums[0]
+    for num in nums:
+        if max < num:
+            max = num
+    return num
+print(findMax())
+    </div>
+
+    <h2>Result</h2>
+    <textarea id="result" readonly></textarea>
+    <script>
+        document.getElementById('logout').addEventListener('click', handleLogout);
+        const userName =  sessionStorage.getItem('userName');
+        const resultElement = document.getElementById("result");
+        let connectionStatus = false;
+        let socket;
+
+        document.addEventListener("DOMContentLoaded", function() {
+            loadCurrentUser();
+        });
+
+        function loadCurrentUser() {
+            if (!userName) {
+                window.location.href = 'index.html';
+            } else {
+                const userElement = document.getElementById('logout');
+                userElement.textContent = "Logout: " + userName;
+            }
+        }
+
+        function handleLogout() {
+            sessionStorage.clear();
+            window.location.href = 'index.html';
+        }
+
+        // Initialize Ace editor
+        const editor = ace.edit("editor");
+        editor.setTheme("ace/theme/xcode");
+        editor.setOptions({
+            fontSize: "16px"
+        });
+        editor.session.setMode("ace/mode/python"); // Use 'ace/mode/java' for Java
+
+
+        function HandleWS() {
+
+            connectionBtn = document.getElementById("connect")
+            if (connectionStatus == false) {
+
+                socket = new WebSocket(`ws://localhost:8081/ws?username=${encodeURIComponent(userName)}`);
+                
+                socket.onopen = () => {
+                    document.body.style.backgroundColor = "#b0f39f";
+                    console.log('Connected to the WebSocket server');
+                };
+
+                socket.onerror = (error) => {
+                    console.error("WebSocket connection failed:", error);
+                    alert("Connect socket server failed!");
+                    // handleLogout();
+                };
+                let ignoreChange = false;
+                editor.session.on('change', (delta) => {
+                    if (ignoreChange) return;
+
+                    // CASE 1: send all text area
+                    const content = editor.getValue();
+                    const message = {
+                        text: content,
+                        user: userName,
+                        position: 0
+                    };
+                    socket.send(JSON.stringify(message));
+
+                    // CASE 2: only send newest character
+                    // if (delta.action === 'insert') {
+                    //     const newestChar = delta.lines.join('\n');  // This captures the inserted text
+                    //     const message = {
+                    //         text: newestChar,
+                    //         user: userName
+                    //     };
+                    //     socket.send(JSON.stringify(message));
+                    // }
+                    
+                });
+                socket.onmessage = (event) => {
+                    const message = JSON.parse(event.data);
+                    ignoreChange = true;
+                    
+                    if (message.position === 0) {
+                        // CASE 1: update all text area
+                        editor.setValue(message.text);
+                        
+                        // CASE 2: Append to the end
+                        // const currentValue = editor.getValue();
+                        // editor.setValue(currentValue + message.text);
+                        ignoreChange = false;
+                    }
+                };
+                socket.onclose = () => {
+                    console.log('Disconnected from the WebSocket server');
+                };
+
+                connectionStatus = true;
+                connectionBtn.textContent = "Sharing";
+            } else {
+                document.body.style.backgroundColor = "white";
+                connectionStatus = false;
+                connectionBtn.textContent = "Share";
+                var message = {
+                    text: "stop",
+                    user: userName,
+                    position: 0
+                };
+                socket.send(JSON.stringify(message))
+                if (socket) {
+                    socket.close();  // Close the WebSocket connection
+                }
+            }
+        }
+        
+        async function Submit() {
+            resultElement.value = "Running ...";
+
+            const requestBody = {
+                Name: "test",
+                Language: 3,
+                Content: editor.getValue(),
+                Input: "#python3"
+            };
+            
+            console.log(requestBody);
+            try {
+                const response = await fetch(`http://localhost:8080/submit`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+                const data = await response.json();
+                resultElement.value = data.Output;  // Ensure correct field name and display output in the textarea
+                
+                // console.log("update result to all members")
+                // display result
+                // message = {
+                //     text: data.Output,
+                //     user: userName,
+                //     position: 1
+                // };
+                // socket.send(JSON.stringify(message));
+
+            } catch (error) {
+                console.error("Error submitting code:", error);
+            }
+        }
+
+    </script>
+</body>
+</html>
