@@ -10,17 +10,16 @@ import (
 func NewServer() {
 	route := gin.Default()
 
+	// allowedOrigins := getAllowedOrigins()
 	route.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"*"},
-		AllowHeaders:     []string{"*"},
-		ExposeHeaders:    []string{"*"},
-		AllowCredentials: true,
-		AllowOriginFunc: func(origin string) bool {
-			return origin == "*"
-		},
-		MaxAge: 12 * time.Hour,
+		// AllowOrigins:  allowedOrigins,
+		AllowAllOrigins: true,
+		AllowMethods:    []string{"GET", "POST", "OPTIONS"},
+		AllowHeaders:    []string{"Origin", "Content-Type", "Accept"},
+		ExposeHeaders:   []string{"Content-Length"},
+		MaxAge:          12 * time.Hour,
 	}))
+
 	route.POST("/submit", submitHandler)
 	route.Run(":8080")
 }

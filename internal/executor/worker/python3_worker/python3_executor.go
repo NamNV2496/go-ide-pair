@@ -18,9 +18,13 @@ import (
 	"github.com/namnv2496/go-ide-pair/internal/model"
 )
 
+const (
+	PythonImage = "python:3.9.19-slim-bullseye"
+)
+
 // Python3JobExecutor handles code execution for Python source codes.
 type Python3JobExecutor struct {
-	cli client.Client
+	cli *client.Client
 	job_executor.JobExecutor
 }
 
@@ -28,26 +32,25 @@ var instance *Python3JobExecutor
 var once sync.Once
 
 func (executor *Python3JobExecutor) Execute(source model.SourceCode) job_executor.JobExecutorOutput {
-	dir, err := os.MkdirTemp("", "workdir")
+	dir, err := os.MkdirTemp("", "py-workdir")
 	if err != nil {
-		return job_executor.JobExecutorOutput{Status: job_executor.ExecutionStatus(model.RuntimeError), Output: fmt.Sprintf("Failed to create temp dir: %v", err)}
+		return job_executor.JobExecutorOutput{Status: job_executor.RuntimeError, Output: fmt.Sprintf("Failed to create temp dir: %v", err)}
 	}
 	defer os.RemoveAll(dir)
 
-	executor.writeSourceFile(dir, source)
+	if err := executor.writeSourceFile(dir, source); err != nil {
+		return job_executor.JobExecutorOutput{Status: job_executor.RuntimeError, Output: fmt.Sprintf("Failed to write source file: %v", err)}
+	}
 
-	return executor.runExecutable(dir, source)
+	return executor.runExecutable(dir)
 }
 
-// Write the source file to a temporary directory.
-func (executor *Python3JobExecutor) writeSourceFile(dir string, source model.SourceCode) {
-	sourceFilePath := fmt.Sprintf("%s/main.py", dir)
-
-	sourceCode := source.Input + "\n" + source.Content
-	err := os.WriteFile(sourceFilePath, []byte(sourceCode), fs.FileMode(0644))
-	if err != nil {
-		panic(err)
+// writeSourceFile writes the source code and input to separate files in dir.
+func (executor *Python3JobExecutor) writeSourceFile(dir string, source model.SourceCode) error {
+	if err := os.WriteFile(fmt.Sprintf("%s/main.py", dir), []byte(source.Content), fs.FileMode(0644)); err != nil {
+		return err
 	}
+	return os.WriteFile(fmt.Sprintf("%s/input.txt", dir), []byte(source.Input), fs.FileMode(0644))
 }
 
 var resourcesConf = container.Resources{
@@ -57,30 +60,26 @@ var resourcesConf = container.Resources{
 
 const timeoutStatusCode = 124
 
-// Run the Python script.
-func (executor *Python3JobExecutor) runExecutable(dir string, source model.SourceCode) job_executor.JobExecutorOutput {
+// runExecutable spins up a Docker container and runs main.py with input.txt on stdin.
+func (executor *Python3JobExecutor) runExecutable(dir string) job_executor.JobExecutorOutput {
 	ctx := context.Background()
 
 	resp, err := executor.cli.ContainerCreate(ctx, &container.Config{
-		Image:        "python:3.9.19-slim-bullseye",
-		WorkingDir:   "/workdir",
-		Cmd:          []string{"timeout", "--foreground", "30s", "python3", "main.py", "|", "head", "-c", "8k"},
-		AttachStdin:  true,
-		AttachStdout: true,
-		AttachStderr: true,
-		OpenStdin:    true,
-		StdinOnce:    true,
+		Image:      PythonImage,
+		WorkingDir: "/workdir",
+		// 2>&1 merges stderr into stdout so error tracebacks appear in the output.
+		Cmd: []string{"sh", "-c", "timeout --foreground 30s python3 main.py < input.txt 2>&1 | head -c 8192"},
 	}, &container.HostConfig{
 		Binds:     []string{fmt.Sprintf("%s:/workdir", dir)},
 		Resources: resourcesConf,
 	}, nil, nil, "")
 	if err != nil {
-		return job_executor.JobExecutorOutput{Status: job_executor.ExecutionStatus(model.RuntimeError), Output: fmt.Sprintf("Failed to create container: %v", err)}
+		return job_executor.JobExecutorOutput{Status: job_executor.RuntimeError, Output: fmt.Sprintf("Failed to create container: %v", err)}
 	}
 
 	defer func() {
 		if err := executor.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{}); err != nil {
-			panic(err)
+			log.Printf("Warning: failed to remove container %s: %v", resp.ID, err)
 		}
 	}()
 
@@ -90,12 +89,12 @@ func (executor *Python3JobExecutor) runExecutable(dir string, source model.Sourc
 		Stderr: true,
 	})
 	if err != nil {
-		return job_executor.JobExecutorOutput{Status: job_executor.ExecutionStatus(model.RuntimeError), Output: fmt.Sprintf("Failed to attach to container: %v", err)}
+		return job_executor.JobExecutorOutput{Status: job_executor.RuntimeError, Output: fmt.Sprintf("Failed to attach to container: %v", err)}
 	}
 	defer attachResp.Close()
 
 	if err := executor.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return job_executor.JobExecutorOutput{Status: job_executor.ExecutionStatus(model.RuntimeError), Output: fmt.Sprintf("Failed to start container: %v", err)}
+		return job_executor.JobExecutorOutput{Status: job_executor.RuntimeError, Output: fmt.Sprintf("Failed to start container: %v", err)}
 	}
 
 	okChan, errChan := executor.cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
@@ -103,7 +102,7 @@ func (executor *Python3JobExecutor) runExecutable(dir string, source model.Sourc
 	case data := <-okChan:
 		inspectResp, err := executor.cli.ContainerInspect(ctx, resp.ID)
 		if err != nil {
-			return job_executor.JobExecutorOutput{Status: job_executor.ExecutionStatus(model.RuntimeError), Output: fmt.Sprintf("Failed to inspect container: %v", err)}
+			return job_executor.JobExecutorOutput{Status: job_executor.RuntimeError, Output: fmt.Sprintf("Failed to inspect container: %v", err)}
 		}
 
 		var status job_executor.ExecutionStatus
@@ -118,28 +117,29 @@ func (executor *Python3JobExecutor) runExecutable(dir string, source model.Sourc
 
 		startTime, err := dateparse.ParseAny(inspectResp.State.StartedAt)
 		if err != nil {
-			return job_executor.JobExecutorOutput{Status: job_executor.ExecutionStatus(model.RuntimeError), Output: fmt.Sprintf("Failed to parse start time: %v", err)}
+			return job_executor.JobExecutorOutput{Status: job_executor.RuntimeError, Output: fmt.Sprintf("Failed to parse start time: %v", err)}
 		}
 		finishTime, err := dateparse.ParseAny(inspectResp.State.FinishedAt)
 		if err != nil {
-			return job_executor.JobExecutorOutput{Status: job_executor.ExecutionStatus(model.RuntimeError), Output: fmt.Sprintf("Failed to parse finish time: %v", err)}
+			return job_executor.JobExecutorOutput{Status: job_executor.RuntimeError, Output: fmt.Sprintf("Failed to parse finish time: %v", err)}
 		}
 		runTime := finishTime.Sub(startTime).Milliseconds()
 
 		stdoutBuffer := new(bytes.Buffer)
 		stderrBuffer := new(bytes.Buffer)
-		stdcopy.StdCopy(stdoutBuffer, stderrBuffer, attachResp.Reader)
-		stdout := stdoutBuffer.String()
+		if _, err := stdcopy.StdCopy(stdoutBuffer, stderrBuffer, attachResp.Reader); err != nil {
+			log.Printf("Warning: stdcopy error: %v", err)
+		}
 
 		return job_executor.JobExecutorOutput{
-			Status: status,
-			// ExitCode: exitCode,
-			RunTime: runTime,
-			Output:  stdout,
+			Status:   status,
+			ExitCode: int(data.StatusCode),
+			RunTime:  runTime,
+			Output:   stdoutBuffer.String(),
 		}
 
 	case err := <-errChan:
-		return job_executor.JobExecutorOutput{Status: job_executor.ExecutionStatus(model.RuntimeError), Output: fmt.Sprintf("Container wait error: %v", err)}
+		return job_executor.JobExecutorOutput{Status: job_executor.RuntimeError, Output: fmt.Sprintf("Container wait error: %v", err)}
 	}
 }
 
@@ -147,22 +147,24 @@ func GetInstance() *Python3JobExecutor {
 	once.Do(func() {
 		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		if err != nil {
-			panic(err)
+			log.Fatal("Failed to create Docker client:", err)
 		}
-		instance = &Python3JobExecutor{
-			cli: *cli,
-		}
+		instance = &Python3JobExecutor{cli: cli}
 		instance.pullImage()
 	})
 	return instance
 }
 
-// Prepare the necessary Docker images, to save time when handling jobs.
+// pullImage pre-pulls the Python image so first executions aren't slow.
 func (executor *Python3JobExecutor) pullImage() {
 	ctx := context.Background()
-	log.Println("Pull image python:3.9.19-slim-bullseye")
-	_, err := executor.cli.ImagePull(ctx, "docker.io/library/python:3.9.19-slim-bullseye", image.PullOptions{})
+	log.Printf("Pulling image %s ...", PythonImage)
+	out, err := executor.cli.ImagePull(ctx, PythonImage, image.PullOptions{})
 	if err != nil {
-		panic(err)
+		log.Fatal("Failed to pull Python image:", err)
 	}
+	if err := out.Close(); err != nil {
+		log.Printf("Warning: error closing image pull stream: %v", err)
+	}
+	log.Println("Python image ready.")
 }

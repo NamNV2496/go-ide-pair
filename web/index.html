@@ -2,27 +2,71 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Save Username to Session Storage</title>
+    <title>Join Coding Session</title>
+    <style>
+        body { font-family: sans-serif; max-width: 440px; margin: 80px auto; padding: 0 20px; }
+        h2   { margin-bottom: 20px; }
+        input {
+            width: 100%; padding: 10px; margin: 6px 0 14px;
+            box-sizing: border-box; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;
+        }
+        label { font-size: 13px; color: #555; }
+        button {
+            width: 100%; padding: 12px; font-size: 16px; cursor: pointer;
+            background: #1976d2; color: white; border: none; border-radius: 4px; margin-top: 4px;
+        }
+        button:hover { background: #1565c0; }
+    </style>
 </head>
 <body>
-    <h2>Enter Your Username</h2>
-    <input type="text" id="usernameInput" placeholder="Enter your username...">
-    <button onclick="saveUsername()">Save Username</button>
+    <h2>Join a Coding Session</h2>
+
+    <label>Your name</label>
+    <input type="text" id="usernameInput" placeholder="e.g. Alice" autocomplete="off">
+
+    <label>Room ID <span style="color:#888">(leave blank to create a new room)</span></label>
+    <input type="text" id="roomInput" placeholder="Paste a room ID to join an existing session">
+
+    <button onclick="joinRoom()">Join / Create Room</button>
 
     <script>
-        function saveUsername() {
-            const username = document.getElementById('usernameInput').value;
-            if (username.trim() === '') {
-                alert('Please enter a valid username.');
+        // Pre-fill from URL if the user arrived via a share link (?room=...)
+        const urlParams  = new URLSearchParams(window.location.search);
+        const roomFromUrl = urlParams.get('room');
+        if (roomFromUrl) {
+            document.getElementById('roomInput').value = roomFromUrl;
+        }
+
+        // Pre-fill username for returning users
+        const savedUser = sessionStorage.getItem('userName');
+        if (savedUser) {
+            document.getElementById('usernameInput').value = savedUser;
+        }
+
+        function generateRoomID() {
+            if (window.crypto && window.crypto.randomUUID) {
+                return window.crypto.randomUUID();
+            }
+            // Fallback for older browsers
+            return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 9);
+        }
+
+        function joinRoom() {
+            const username = document.getElementById('usernameInput').value.trim();
+            if (!username) {
+                alert('Please enter your name.');
+                document.getElementById('usernameInput').focus();
                 return;
             }
-
-            // Save username to sessionStorage
+            const room = document.getElementById('roomInput').value.trim() || generateRoomID();
             sessionStorage.setItem('userName', username);
-            // Optionally, redirect or perform other actions after saving
-            window.location.href = 'coding.html';
+            window.location.href = `coding.html?room=${encodeURIComponent(room)}`;
         }
+
+        // Submit on Enter key
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') joinRoom();
+        });
     </script>
 </body>
 </html>

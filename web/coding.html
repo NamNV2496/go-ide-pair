@@ -4,196 +4,262 @@
     <meta charset="UTF-8">
     <title>Shared Editor</title>
     <style>
-        #editor {
+        body { font-family: sans-serif; margin: 0; padding: 12px 16px; }
+        #toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+        #editor { width: 100%; height: 420px; border: 1px solid #ccc; font-size: 16px; }
+        #input-area, #result {
             width: 100%;
-            height: 500px;
-            border: 1px solid #ccc;
-        }
-        #input, #result {
-            width: 100%;
-            height: 100px;
+            height: 90px;
             border: 1px solid #ccc;
             font-family: monospace;
-            font-size: 16px;
-            overflow: auto;
-            background-color: #f5f5f5;
-            white-space: pre-wrap; /* Preserve whitespace and line breaks */
+            font-size: 14px;
+            resize: vertical;
+            box-sizing: border-box;
+            padding: 6px;
         }
-        #connect, #logout, #submit {
-            padding: 10px;
-            font-size: 16px;
-        }
+        #share-url { width: 340px; font-size: 13px; padding: 4px 6px; }
+        button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
+        #connect { background: #4caf50; color: white; border: none; border-radius: 4px; }
+        #connect.sharing { background: #f57c00; }
+        #submit { background: #1976d2; color: white; border: none; border-radius: 4px; }
+        label { font-size: 13px; color: #555; }
+        h3 { margin: 10px 0 4px; }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.12/ace.js"></script>
 </head>
 <body>
 
-    <button id="connect" type="button" onclick="HandleWS()">Share</button>
-    <button id="logout" type="button">Logout</button>
-    <h1>Shared Editor</h1>
-    <div></div>
-    <button id="submit" type="button" onclick="Submit()" >Submit</button>
-    
-    <div id="editor">
-nums = [1,5,2,7,9]
-def findMax():
-    max = nums[0]
-    for num in nums:
-        if max < num:
-            max = num
-    return num
-print(findMax())
-    </div>
+<div id="toolbar">
+    <button id="connect" onclick="HandleWS()">Share</button>
+    <button id="logout">Logout</button>
+    <select id="language">
+        <option value="3">Python 3</option>
+        <option value="2">Java</option>
+    </select>
+    <button id="submit" onclick="Submit()">&#9654; Run</button>
+    <span style="margin-left:auto; font-size:13px;">
+        Room: <strong id="room-id"></strong>&nbsp;
+        <input id="share-url" readonly title="Share this link">
+        <button onclick="copyLink()">Copy Link</button>
+    </span>
+</div>
 
-    <h2>Result</h2>
-    <textarea id="result" readonly></textarea>
-    <script>
-        document.getElementById('logout').addEventListener('click', handleLogout);
-        const userName =  sessionStorage.getItem('userName');
-        const resultElement = document.getElementById("result");
-        let connectionStatus = false;
-        let socket;
+<div id="editor">nums = [1, 5, 2, 7, 9]
 
-        document.addEventListener("DOMContentLoaded", function() {
-            loadCurrentUser();
-        });
+def find_max(arr):
+    m = arr[0]
+    for n in arr:
+        if n > m:
+            m = n
+    return m
 
-        function loadCurrentUser() {
-            if (!userName) {
-                window.location.href = 'index.html';
-            } else {
-                const userElement = document.getElementById('logout');
-                userElement.textContent = "Logout: " + userName;
+print(find_max(nums))
+</div>
+
+<h3>Input (stdin)</h3>
+<textarea id="input-area" placeholder="Standard input for your program..."></textarea>
+
+<h3>Output</h3>
+<textarea id="result" readonly placeholder="Run your code to see output here."></textarea>
+
+<script>
+// ── Setup ──────────────────────────────────────────────────────────────────
+const urlParams = new URLSearchParams(window.location.search);
+const roomId    = urlParams.get('room');
+const userName  = sessionStorage.getItem('userName');
+
+if (!roomId)    { window.location.href = 'index.html'; }
+if (!userName)  { window.location.href = `index.html?room=${encodeURIComponent(roomId)}`; }
+
+document.getElementById('room-id').textContent = roomId;
+document.getElementById('share-url').value     = window.location.href;
+
+document.getElementById('logout').textContent = `Logout: ${userName}`;
+document.getElementById('logout').addEventListener('click', () => {
+    sessionStorage.clear();
+    window.location.href = 'index.html';
+});
+
+function copyLink() {
+    navigator.clipboard.writeText(window.location.href)
+        .catch(() => { document.getElementById('share-url').select(); document.execCommand('copy'); });
+}
+
+// ── Ace editor ────────────────────────────────────────────────────────────
+const editor = ace.edit("editor");
+editor.setTheme("ace/theme/xcode");
+editor.setOptions({ fontSize: "16px", tabSize: 4, useSoftTabs: true });
+editor.session.setMode("ace/mode/python");
+
+document.getElementById('language').addEventListener('change', function () {
+    const modeMap = { '2': 'java', '3': 'python' };
+    editor.session.setMode(`ace/mode/${modeMap[this.value] || 'python'}`);
+});
+
+// ── WebSocket state ───────────────────────────────────────────────────────
+let socket          = null;
+let connectionStatus = false;
+let ignoreChange    = false;
+
+// synced = true once we have the current room document (or confirmed we're alone).
+// While synced=false, incoming deltas are queued but not applied yet.
+let synced          = false;
+let pendingDeltas   = [];   // deltas received before a full_sync
+
+// ── Send deltas on every local change ─────────────────────────────────────
+// Registered once — the connectionStatus/socket guards prevent spurious sends.
+editor.session.on('change', (delta) => {
+    if (ignoreChange || !connectionStatus || !socket || socket.readyState !== WebSocket.OPEN) return;
+    // Once the local user types, they are by definition the source of truth.
+    synced = true;
+    pendingDeltas = [];
+    socket.send(JSON.stringify({
+        type:    'delta',
+        payload: JSON.stringify(delta),
+        user:    userName,
+        roomId:  roomId
+    }));
+});
+
+// ── WebSocket connect/disconnect ──────────────────────────────────────────
+function HandleWS() {
+    const btn = document.getElementById('connect');
+
+    if (connectionStatus) {
+        // ── Disconnect ──
+        if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: 'stop', user: userName, roomId, payload: '' }));
+            socket.close();
+        }
+        connectionStatus = false;
+        btn.textContent = 'Share';
+        btn.classList.remove('sharing');
+        document.body.style.background = '';
+        return;
+    }
+
+    // ── Connect ──
+    socket = new WebSocket(
+        `ws://localhost:8081/ws?username=${encodeURIComponent(userName)}&room=${encodeURIComponent(roomId)}`
+    );
+
+    socket.onopen = () => {
+        connectionStatus = true;
+        synced           = false;
+        pendingDeltas    = [];
+        btn.textContent  = 'Sharing';
+        btn.classList.add('sharing');
+        document.body.style.background = '#e8f5e9';
+
+        // Ask anyone already in the room for the current document.
+        socket.send(JSON.stringify({ type: 'request_sync', user: userName, roomId, payload: '' }));
+
+        // If nobody responds in 3 s we're the first in the room — start fresh.
+        setTimeout(() => {
+            if (!synced) {
+                synced = true;
+                applyPendingDeltas();
             }
-        }
+        }, 3000);
+    };
 
-        function handleLogout() {
-            sessionStorage.clear();
-            window.location.href = 'index.html';
-        }
+    socket.onerror = () => {
+        alert('WebSocket connection failed. Is the server running on :8080?');
+    };
 
-        // Initialize Ace editor
-        const editor = ace.edit("editor");
-        editor.setTheme("ace/theme/xcode");
-        editor.setOptions({
-            fontSize: "16px"
-        });
-        editor.session.setMode("ace/mode/python"); // Use 'ace/mode/java' for Java
+    socket.onclose = () => {
+        connectionStatus = false;
+        btn.textContent  = 'Share';
+        btn.classList.remove('sharing');
+        document.body.style.background = '';
+    };
 
+    socket.onmessage = (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch (e) { return; }
 
-        function HandleWS() {
+        switch (msg.type) {
 
-            connectionBtn = document.getElementById("connect")
-            if (connectionStatus == false) {
-
-                socket = new WebSocket(`ws://localhost:8081/ws?username=${encodeURIComponent(userName)}`);
-                
-                socket.onopen = () => {
-                    document.body.style.backgroundColor = "#b0f39f";
-                    console.log('Connected to the WebSocket server');
-                };
-
-                socket.onerror = (error) => {
-                    console.error("WebSocket connection failed:", error);
-                    alert("Connect socket server failed!");
-                    // handleLogout();
-                };
-                let ignoreChange = false;
-                editor.session.on('change', (delta) => {
-                    if (ignoreChange) return;
-
-                    // CASE 1: send all text area
-                    const content = editor.getValue();
-                    const message = {
-                        text: content,
-                        user: userName,
-                        position: 0
-                    };
-                    socket.send(JSON.stringify(message));
-
-                    // CASE 2: only send newest character
-                    // if (delta.action === 'insert') {
-                    //     const newestChar = delta.lines.join('\n');  // This captures the inserted text
-                    //     const message = {
-                    //         text: newestChar,
-                    //         user: userName
-                    //     };
-                    //     socket.send(JSON.stringify(message));
-                    // }
-                    
-                });
-                socket.onmessage = (event) => {
-                    const message = JSON.parse(event.data);
-                    ignoreChange = true;
-                    
-                    if (message.position === 0) {
-                        // CASE 1: update all text area
-                        editor.setValue(message.text);
-                        
-                        // CASE 2: Append to the end
-                        // const currentValue = editor.getValue();
-                        // editor.setValue(currentValue + message.text);
-                        ignoreChange = false;
-                    }
-                };
-                socket.onclose = () => {
-                    console.log('Disconnected from the WebSocket server');
-                };
-
-                connectionStatus = true;
-                connectionBtn.textContent = "Sharing";
-            } else {
-                document.body.style.backgroundColor = "white";
-                connectionStatus = false;
-                connectionBtn.textContent = "Share";
-                var message = {
-                    text: "stop",
-                    user: userName,
-                    position: 0
-                };
-                socket.send(JSON.stringify(message))
-                if (socket) {
-                    socket.close();  // Close the WebSocket connection
+            case 'request_sync':
+                // Someone new joined — send them the current document.
+                if (socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({
+                        type:    'full_sync',
+                        payload: editor.getValue(),
+                        user:    userName,
+                        roomId
+                    }));
                 }
-            }
+                break;
+
+            case 'full_sync':
+                // Accept the first full_sync received after connecting.
+                if (!synced) {
+                    synced = true;
+                    ignoreChange = true;
+                    editor.setValue(msg.payload, 1); // cursor to start
+                    editor.clearSelection();
+                    ignoreChange = false;
+                    applyPendingDeltas();
+                }
+                break;
+
+            case 'delta':
+                if (synced) {
+                    applyDelta(msg.payload);
+                } else {
+                    // Buffer deltas that arrive before we have the full document.
+                    pendingDeltas.push(msg.payload);
+                }
+                break;
         }
-        
-        async function Submit() {
-            resultElement.value = "Running ...";
+    };
+}
 
-            const requestBody = {
-                Name: "test",
-                Language: 3,
-                Content: editor.getValue(),
-                Input: "#python3"
-            };
-            
-            console.log(requestBody);
-            try {
-                const response = await fetch(`http://localhost:8080/submit`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify(requestBody)
-                });
-                const data = await response.json();
-                resultElement.value = data.Output;  // Ensure correct field name and display output in the textarea
-                
-                // console.log("update result to all members")
-                // display result
-                // message = {
-                //     text: data.Output,
-                //     user: userName,
-                //     position: 1
-                // };
-                // socket.send(JSON.stringify(message));
+// Apply a JSON-encoded Ace delta, preserving the local cursor.
+function applyDelta(payloadStr) {
+    ignoreChange = true;
+    try {
+        editor.session.getDocument().applyDelta(JSON.parse(payloadStr));
+    } catch (e) {
+        console.warn('Delta apply failed (ignored):', e);
+    } finally {
+        ignoreChange = false;
+    }
+}
 
-            } catch (error) {
-                console.error("Error submitting code:", error);
-            }
+// Apply deltas that arrived during the sync handshake.
+function applyPendingDeltas() {
+    for (const p of pendingDeltas) {
+        applyDelta(p);
+    }
+    pendingDeltas = [];
+}
+
+// ── Submit ────────────────────────────────────────────────────────────────
+async function Submit() {
+    const resultEl = document.getElementById('result');
+    resultEl.value = 'Running…';
+
+    const lang  = parseInt(document.getElementById('language').value, 10);
+    const input = document.getElementById('input-area').value;
+
+    try {
+        const response = await fetch('http://localhost:8080/submit', {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ Name: 'submission', Language: lang, Content: editor.getValue(), Input: input })
+        });
+        const data = await response.json();
+        if (!response.ok) {
+            resultEl.value = 'Error: ' + (data.error || response.statusText);
+        } else {
+            resultEl.value = data.Output !== undefined ? (data.Output || '(no output)') : JSON.stringify(data);
         }
-
-    </script>
+    } catch (e) {
+        resultEl.value = 'Request failed: ' + e.message;
+    }
+}
+</script>
 </body>
 </html>

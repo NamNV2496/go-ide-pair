@@ -1,6 +1,6 @@
 module github.com/namnv2496/go-ide-pair
 
-go 1.22.2
+go 1.25
 
 require github.com/docker/docker v27.0.3+incompatible
 
