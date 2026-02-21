@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/araddon/dateparse"
@@ -45,12 +47,21 @@ func (executor *Python3JobExecutor) Execute(source model.SourceCode) job_executo
 	return executor.runExecutable(dir)
 }
 
-// writeSourceFile writes the source code and input to separate files in dir.
+// writeSourceFile writes the source code and formatted stdin to separate files.
 func (executor *Python3JobExecutor) writeSourceFile(dir string, source model.SourceCode) error {
+	// content := bytes.Join([][]byte{[]byte(formatStdin(source.Input)), []byte(source.Content)}, []byte("\n"))
 	if err := os.WriteFile(fmt.Sprintf("%s/main.py", dir), []byte(source.Content), fs.FileMode(0644)); err != nil {
 		return err
 	}
-	return os.WriteFile(fmt.Sprintf("%s/input.txt", dir), []byte(source.Input), fs.FileMode(0644))
+	return nil
+}
+
+func formatStdin(raw string) string {
+	parts := strings.Split(raw, ",")
+	for i, p := range parts {
+		parts[i] = strings.TrimSpace(p)
+	}
+	return strings.Join(parts, "\n")
 }
 
 var resourcesConf = container.Resources{
@@ -67,8 +78,7 @@ func (executor *Python3JobExecutor) runExecutable(dir string) job_executor.JobEx
 	resp, err := executor.cli.ContainerCreate(ctx, &container.Config{
 		Image:      PythonImage,
 		WorkingDir: "/workdir",
-		// 2>&1 merges stderr into stdout so error tracebacks appear in the output.
-		Cmd: []string{"sh", "-c", "timeout --foreground 30s python3 main.py < input.txt 2>&1 | head -c 8192"},
+		Cmd:        []string{"sh", "-c", "timeout --foreground 30s python3 main.py | head -c 8192"},
 	}, &container.HostConfig{
 		Binds:     []string{fmt.Sprintf("%s:/workdir", dir)},
 		Resources: resourcesConf,
@@ -156,15 +166,18 @@ func GetInstance() *Python3JobExecutor {
 }
 
 // pullImage pre-pulls the Python image so first executions aren't slow.
+// The response body MUST be fully drained before closing — otherwise Docker
+// cancels the download mid-flight and the image is never stored locally.
 func (executor *Python3JobExecutor) pullImage() {
 	ctx := context.Background()
-	log.Printf("Pulling image %s ...", PythonImage)
+	log.Printf("Pulling image %s (this may take a minute on first run) ...", PythonImage)
 	out, err := executor.cli.ImagePull(ctx, PythonImage, image.PullOptions{})
 	if err != nil {
 		log.Fatal("Failed to pull Python image:", err)
 	}
-	if err := out.Close(); err != nil {
-		log.Printf("Warning: error closing image pull stream: %v", err)
+	defer out.Close()
+	if _, err := io.Copy(io.Discard, out); err != nil {
+		log.Printf("Warning: error reading image pull stream: %v", err)
 	}
 	log.Println("Python image ready.")
 }
