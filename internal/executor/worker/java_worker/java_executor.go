@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/araddon/dateparse"
@@ -51,17 +53,113 @@ func (executor *JavaJobExecutor) Execute(source model.SourceCode) job_executor.J
 	return executor.runExecutable(dir)
 }
 
-// writeSourceFile writes Main.java and input.txt to the working directory.
+// javaRunner is written to runner.sh in every workdir.
+// It compiles Main.java (exit 100 on failure), then feeds each test-case group
+// (blank-line-separated blocks in input.txt) to java Main via a temp file.
+const javaRunner = `#!/bin/sh
+javac Main.java 2>&1
+if [ $? -ne 0 ]; then
+    exit 100
+fi
+
+if [ ! -s input.txt ]; then
+    java Main
+    exit $?
+fi
+
+tmpfile=$(mktemp)
+has_content=0
+
+flush() {
+    if [ "$has_content" -eq 1 ]; then
+        java Main < "$tmpfile"
+        : > "$tmpfile"
+        has_content=0
+    fi
+}
+
+while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ]; then
+        flush
+    else
+        printf '%s\n' "$line" >> "$tmpfile"
+        has_content=1
+    fi
+done < input.txt
+
+flush
+rm -f "$tmpfile"
+`
+
+// writeSourceFile writes Main.java, the preprocessed input.txt, and runner.sh.
 func (executor *JavaJobExecutor) writeSourceFile(dir string, source model.SourceCode) error {
 	if err := os.WriteFile(fmt.Sprintf("%s/Main.java", dir), []byte(source.Content), fs.FileMode(0644)); err != nil {
 		return err
 	}
-	return os.WriteFile(fmt.Sprintf("%s/input.txt", dir), []byte(source.Input), fs.FileMode(0644))
+	if err := os.WriteFile(fmt.Sprintf("%s/input.txt", dir), []byte(preprocessTestCases(source.Input)), fs.FileMode(0644)); err != nil {
+		return err
+	}
+	return os.WriteFile(fmt.Sprintf("%s/runner.sh", dir), []byte(javaRunner), fs.FileMode(0755))
 }
 
-// runExecutable compiles Main.java then runs it inside a Docker container.
-// Exit code 100 is used as a sentinel for compile errors so they can be
-// distinguished from runtime errors in the status mapping below.
+// preprocessTestCases, splitTopLevel, and extractValue are shared parsing helpers.
+// See python3_executor.go for documentation — logic is identical.
+func preprocessTestCases(raw string) string {
+	var groups []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		tokens := splitTopLevel(line)
+		vals := make([]string, 0, len(tokens))
+		for _, tok := range tokens {
+			vals = append(vals, extractValue(tok))
+		}
+		groups = append(groups, strings.Join(vals, "\n"))
+	}
+	return strings.Join(groups, "\n\n")
+}
+
+func splitTopLevel(s string) []string {
+	var parts []string
+	depth := 0
+	var cur strings.Builder
+	for _, ch := range s {
+		switch ch {
+		case '(', '[', '{':
+			depth++
+			cur.WriteRune(ch)
+		case ')', ']', '}':
+			depth--
+			cur.WriteRune(ch)
+		case ',':
+			if depth == 0 {
+				parts = append(parts, strings.TrimSpace(cur.String()))
+				cur.Reset()
+			} else {
+				cur.WriteRune(ch)
+			}
+		default:
+			cur.WriteRune(ch)
+		}
+	}
+	if cur.Len() > 0 {
+		parts = append(parts, strings.TrimSpace(cur.String()))
+	}
+	return parts
+}
+
+func extractValue(token string) string {
+	token = strings.TrimSpace(token)
+	if i := strings.Index(token, "="); i >= 0 {
+		return strings.TrimSpace(token[i+1:])
+	}
+	return token
+}
+
+// runExecutable runs runner.sh inside a Docker container.
+// Exit code 100 = compile error, 124 = timeout, other non-zero = runtime error.
 func (executor *JavaJobExecutor) runExecutable(dir string) job_executor.JobExecutorOutput {
 	ctx := context.Background()
 
@@ -70,7 +168,7 @@ func (executor *JavaJobExecutor) runExecutable(dir string) job_executor.JobExecu
 		WorkingDir: "/workdir",
 		Cmd: []string{
 			"sh", "-c",
-			"javac Main.java 2>&1; [ $? -ne 0 ] && exit 100; timeout --foreground 30s java Main < input.txt 2>&1 | head -c 8192",
+			"timeout --foreground 60s sh runner.sh 2>&1 | head -c 8192",
 		},
 	}, &container.HostConfig{
 		Binds:     []string{fmt.Sprintf("%s:/workdir", dir)},
@@ -161,11 +259,14 @@ func GetInstance() *JavaJobExecutor {
 // pullImage pre-pulls the OpenJDK image so first executions aren't slow.
 func (executor *JavaJobExecutor) pullImage() {
 	ctx := context.Background()
-	log.Println("Pulling image openjdk:17-slim ...")
+	log.Println("Pulling image openjdk:17-slim (this may take a minute on first run) ...")
 	out, err := executor.cli.ImagePull(ctx, "docker.io/library/openjdk:17-slim", image.PullOptions{})
 	if err != nil {
 		log.Fatal("Failed to pull Java image:", err)
 	}
-	out.Close()
+	defer out.Close()
+	if _, err := io.Copy(io.Discard, out); err != nil {
+		log.Printf("Warning: error reading image pull stream: %v", err)
+	}
 	log.Println("Java image ready.")
 }

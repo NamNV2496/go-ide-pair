@@ -47,21 +47,118 @@ func (executor *Python3JobExecutor) Execute(source model.SourceCode) job_executo
 	return executor.runExecutable(dir)
 }
 
-// writeSourceFile writes the source code and formatted stdin to separate files.
+// pythonRunnerScript is written to runner.py in every workdir.
+// For each test case group in input.txt, it prepends the variable assignments
+// to main.py and runs the combined file — so the user's code can reference
+// nums, k, etc. directly without calling input().
+// If input.txt is empty, main.py is run as-is.
+const pythonRunnerScript = `#!/usr/bin/env python3
+import subprocess, sys
+
+with open('main.py') as f:
+    solution = f.read()
+
+with open('input.txt') as f:
+    content = f.read().strip()
+
+# Each test case is a block of "key=value" lines, groups separated by blank lines.
+groups = [g.strip() for g in content.split('\n\n') if g.strip()]
+
+if not groups:
+    proc = subprocess.run(['python3', 'main.py'], text=True, capture_output=True)
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    sys.exit(proc.returncode)
+
+for group in groups:
+    # Prepend variable assignments so the solution can use them directly.
+    combined = group + '\n' + solution
+    with open('run_case.py', 'w') as f:
+        f.write(combined)
+    try:
+        proc = subprocess.run(
+            ['python3', 'run_case.py'],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        sys.stdout.write(proc.stdout)
+        sys.stderr.write(proc.stderr)
+    except subprocess.TimeoutExpired:
+        print('Time Limit Exceeded', file=sys.stderr)
+        sys.exit(124)
+`
+
+// writeSourceFile writes main.py, the preprocessed input.txt, and runner.py.
 func (executor *Python3JobExecutor) writeSourceFile(dir string, source model.SourceCode) error {
-	// content := bytes.Join([][]byte{[]byte(formatStdin(source.Input)), []byte(source.Content)}, []byte("\n"))
 	if err := os.WriteFile(fmt.Sprintf("%s/main.py", dir), []byte(source.Content), fs.FileMode(0644)); err != nil {
 		return err
 	}
-	return nil
+	if err := os.WriteFile(fmt.Sprintf("%s/input.txt", dir), []byte(preprocessTestCases(source.Input)), fs.FileMode(0644)); err != nil {
+		return err
+	}
+	return os.WriteFile(fmt.Sprintf("%s/runner.py", dir), []byte(pythonRunnerScript), fs.FileMode(0755))
 }
 
-func formatStdin(raw string) string {
-	parts := strings.Split(raw, ",")
-	for i, p := range parts {
-		parts[i] = strings.TrimSpace(p)
+// preprocessTestCases converts the UI input format into Python variable assignment blocks.
+//
+// UI format (one test case per line, variables separated by top-level commas):
+//   nums=[1,2,4,5], k=3
+//   nums=[1,2,4,9], k=6
+//
+// Produces (blank line between test cases, one assignment per line):
+//   nums=[1,2,4,5]
+//   k=3
+//
+//   nums=[1,2,4,9]
+//   k=6
+//
+// Commas inside brackets are ignored — splitTopLevel handles nested structures.
+func preprocessTestCases(raw string) string {
+	var groups []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		tokens := splitTopLevel(line)
+		stmts := make([]string, 0, len(tokens))
+		for _, tok := range tokens {
+			stmts = append(stmts, strings.TrimSpace(tok))
+		}
+		groups = append(groups, strings.Join(stmts, "\n"))
 	}
-	return strings.Join(parts, "\n")
+	return strings.Join(groups, "\n\n")
+}
+
+// splitTopLevel splits s by comma, ignoring commas nested inside [], {}, or ().
+func splitTopLevel(s string) []string {
+	var parts []string
+	depth := 0
+	var cur strings.Builder
+	for _, ch := range s {
+		switch ch {
+		case '(', '[', '{':
+			depth++
+			cur.WriteRune(ch)
+		case ')', ']', '}':
+			depth--
+			cur.WriteRune(ch)
+		case ',':
+			if depth == 0 {
+				parts = append(parts, strings.TrimSpace(cur.String()))
+				cur.Reset()
+			} else {
+				cur.WriteRune(ch)
+			}
+		default:
+			cur.WriteRune(ch)
+		}
+	}
+	if cur.Len() > 0 {
+		parts = append(parts, strings.TrimSpace(cur.String()))
+	}
+	return parts
 }
 
 var resourcesConf = container.Resources{
@@ -78,7 +175,7 @@ func (executor *Python3JobExecutor) runExecutable(dir string) job_executor.JobEx
 	resp, err := executor.cli.ContainerCreate(ctx, &container.Config{
 		Image:      PythonImage,
 		WorkingDir: "/workdir",
-		Cmd:        []string{"sh", "-c", "timeout --foreground 30s python3 main.py | head -c 8192"},
+		Cmd: []string{"sh", "-c", "timeout --foreground 30s python3 runner.py 2>&1 | head -c 8192"},
 	}, &container.HostConfig{
 		Binds:     []string{fmt.Sprintf("%s:/workdir", dir)},
 		Resources: resourcesConf,

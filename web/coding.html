@@ -24,6 +24,17 @@
         #submit { background: #1976d2; color: white; border: none; border-radius: 4px; }
         label { font-size: 13px; color: #555; }
         h3 { margin: 10px 0 4px; }
+        .remote-cursor-label {
+            position: absolute;
+            font-size: 11px;
+            color: white;
+            padding: 1px 5px;
+            border-radius: 3px 3px 3px 0;
+            pointer-events: none;
+            z-index: 100;
+            white-space: nowrap;
+            opacity: 0.9;
+        }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.12/ace.js"></script>
 </head>
@@ -57,7 +68,7 @@ print(find_max(nums))
 </div>
 
 <h3>Input (stdin)</h3>
-<textarea id="input-area" placeholder="Input format: comma = new variable line, Enter = new test case&#10;e.g.  5,3 4&#10;      10,1 2 3&#10;sends: 5 → 3 4 → 10 → 1 2 3 on separate lines"></textarea>
+<textarea id="input-area" placeholder="One test case per line. Comma separates variables (key=value or plain).&#10;e.g.&#10;nums=[1,2,4,5], k=3&#10;nums=[1,2,4,9], k=6&#10;&#10;→ runs the program once per line"></textarea>
 
 <h3>Output</h3>
 <textarea id="result" readonly placeholder="Run your code to see output here."></textarea>
@@ -96,6 +107,10 @@ document.getElementById('language').addEventListener('change', function () {
     editor.session.setMode(`ace/mode/${modeMap[this.value] || 'python'}`);
 });
 
+// ── Refs to input/output textareas ────────────────────────────────────────
+const inputArea = document.getElementById('input-area');
+const resultEl  = document.getElementById('result');
+
 // ── WebSocket state ───────────────────────────────────────────────────────
 let socket          = null;
 let connectionStatus = false;
@@ -105,6 +120,10 @@ let ignoreChange    = false;
 // While synced=false, incoming deltas are queued but not applied yet.
 let synced          = false;
 let pendingDeltas   = [];   // deltas received before a full_sync
+
+// Guards to prevent echo loops when we receive remote input/output updates.
+let ignoreInputChange  = false;
+let ignoreOutputChange = false;
 
 // ── Send deltas on every local change ─────────────────────────────────────
 // Registered once — the connectionStatus/socket guards prevent spurious sends.
@@ -120,6 +139,33 @@ editor.session.on('change', (delta) => {
         roomId:  roomId
     }));
 });
+
+// ── Sync input textarea ───────────────────────────────────────────────────
+let inputThrottle = null;
+inputArea.addEventListener('input', () => {
+    if (ignoreInputChange) return;
+    clearTimeout(inputThrottle);
+    inputThrottle = setTimeout(() => {
+        if (!connectionStatus || !socket || socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify({
+            type:    'input_sync',
+            payload: inputArea.value,
+            user:    userName,
+            roomId:  roomId
+        }));
+    }, 150);
+});
+
+// ── Helper to broadcast output ────────────────────────────────────────────
+function broadcastOutput(text) {
+    if (!connectionStatus || !socket || socket.readyState !== WebSocket.OPEN) return;
+    socket.send(JSON.stringify({
+        type:    'output_sync',
+        payload: text,
+        user:    userName,
+        roomId:  roomId
+    }));
+}
 
 // ── WebSocket connect/disconnect ──────────────────────────────────────────
 function HandleWS() {
@@ -172,6 +218,7 @@ function HandleWS() {
         btn.textContent  = 'Share';
         btn.classList.remove('sharing');
         document.body.style.background = '';
+        clearAllRemoteUsers();
     };
 
     socket.onmessage = (event) => {
@@ -181,11 +228,16 @@ function HandleWS() {
         switch (msg.type) {
 
             case 'request_sync':
-                // Someone new joined — send them the current document.
+                // Someone new joined — send them the current document + input + output.
                 if (socket.readyState === WebSocket.OPEN) {
+                    const syncPayload = JSON.stringify({
+                        code:   editor.getValue(),
+                        input:  inputArea.value,
+                        output: resultEl.value
+                    });
                     socket.send(JSON.stringify({
                         type:    'full_sync',
-                        payload: editor.getValue(),
+                        payload: syncPayload,
                         user:    userName,
                         roomId
                     }));
@@ -195,11 +247,23 @@ function HandleWS() {
             case 'full_sync':
                 // Accept the first full_sync received after connecting.
                 if (!synced) {
-                    synced = true;
+                    synced       = true;
                     ignoreChange = true;
-                    editor.setValue(msg.payload, 1); // cursor to start
-                    editor.clearSelection();
+                    ignoreCursor = true;
+                    clearTimeout(cursorThrottle);
+                    try {
+                        const syncData = JSON.parse(msg.payload);
+                        editor.setValue(syncData.code, 1);
+                        editor.clearSelection();
+                        inputArea.value = syncData.input  || '';
+                        resultEl.value  = syncData.output || '';
+                    } catch (e) {
+                        // Fallback: old format where payload is just the code text.
+                        editor.setValue(msg.payload, 1);
+                        editor.clearSelection();
+                    }
                     ignoreChange = false;
+                    ignoreCursor = false;
                     applyPendingDeltas();
                 }
                 break;
@@ -208,9 +272,32 @@ function HandleWS() {
                 if (synced) {
                     applyDelta(msg.payload);
                 } else {
-                    // Buffer deltas that arrive before we have the full document.
                     pendingDeltas.push(msg.payload);
                 }
+                break;
+
+            case 'input_sync':
+                ignoreInputChange = true;
+                inputArea.value = msg.payload;
+                ignoreInputChange = false;
+                break;
+
+            case 'output_sync':
+                ignoreOutputChange = true;
+                resultEl.value = msg.payload;
+                ignoreOutputChange = false;
+                break;
+
+            case 'cursor':
+                try {
+                    updateRemoteCursor(msg.user, JSON.parse(msg.payload));
+                } catch (e) {
+                    console.warn('Cursor update failed:', e);
+                }
+                break;
+
+            case 'user_left':
+                clearRemoteUser(msg.user);
                 break;
         }
     };
@@ -218,13 +305,16 @@ function HandleWS() {
 
 // Apply a JSON-encoded Ace delta, preserving the local cursor.
 function applyDelta(payloadStr) {
-    ignoreChange = true;
+    ignoreChange  = true;
+    ignoreCursor  = true;
+    clearTimeout(cursorThrottle);
     try {
         editor.session.getDocument().applyDelta(JSON.parse(payloadStr));
     } catch (e) {
         console.warn('Delta apply failed (ignored):', e);
     } finally {
         ignoreChange = false;
+        ignoreCursor = false;
     }
 }
 
@@ -236,13 +326,173 @@ function applyPendingDeltas() {
     pendingDeltas = [];
 }
 
+// ── Remote cursors (DOM overlays — no Ace markers) ────────────────────────
+// Each entry: { selDivs: [], curDiv: null, labelEl: null, color, curRow, curCol }
+const remoteUsers = new Map();
+
+function userColor(name) {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) | 0;
+    return `hsl(${(hash >>> 0) % 360},70%,45%)`;
+}
+
+function updateRemoteCursor(name, data) {
+    const color    = userColor(name);
+    const session  = editor.session;
+    const existing = remoteUsers.get(name) || { selDivs: [], curDiv: null, labelEl: null };
+
+    // Remove old overlay elements.
+    for (const d of existing.selDivs) d.remove();
+    if (existing.curDiv) existing.curDiv.remove();
+
+    const renderer   = editor.renderer;
+    const lineHeight = renderer.lineHeight;
+    const charWidth  = renderer.characterWidth;
+    const scrollTop  = renderer.getScrollTop();
+    const scrollLeft = renderer.getScrollLeft();
+    const gutterW    = renderer.$gutterLayer.gutterWidth || 0;
+    const alphaColor = color.replace('hsl(', 'hsla(').replace(')', ',0.25)');
+
+    // ── Selection highlight divs ──
+    const sel     = data.selection;
+    const selDivs = [];
+    const hasSel  = sel.start.row !== sel.end.row || sel.start.column !== sel.end.column;
+    if (hasSel) {
+        for (let row = sel.start.row; row <= sel.end.row; row++) {
+            const sCol   = (row === sel.start.row) ? sel.start.column : 0;
+            const eCol   = (row === sel.end.row)   ? sel.end.column   : session.getLine(row).length;
+            const w      = Math.max(1, (eCol - sCol) * charWidth);
+            const div    = document.createElement('div');
+            div.style.cssText =
+                `position:absolute;pointer-events:none;z-index:5;` +
+                `background:${alphaColor};height:${lineHeight}px;` +
+                `top:${row * lineHeight - scrollTop}px;` +
+                `left:${sCol * charWidth - scrollLeft + gutterW}px;` +
+                `width:${w}px;`;
+            div.dataset.row  = row;
+            div.dataset.sCol = sCol;
+            editor.container.appendChild(div);
+            selDivs.push(div);
+        }
+    }
+
+    // ── Cursor caret div ──
+    const cur    = data.cursor;
+    const curDiv = document.createElement('div');
+    curDiv.style.cssText =
+        `position:absolute;pointer-events:none;z-index:6;` +
+        `background:${color};width:2px;height:${lineHeight}px;` +
+        `top:${cur.row * lineHeight - scrollTop}px;` +
+        `left:${cur.column * charWidth - scrollLeft + gutterW}px;`;
+    editor.container.appendChild(curDiv);
+
+    // ── Floating name label ──
+    let labelEl = existing.labelEl;
+    if (!labelEl) {
+        labelEl = document.createElement('div');
+        labelEl.className = 'remote-cursor-label';
+        labelEl.textContent = name;
+        labelEl.style.background = color;
+        editor.container.style.position = 'relative';
+        editor.container.appendChild(labelEl);
+    }
+    positionLabel(labelEl, cur.row, cur.column);
+
+    remoteUsers.set(name, { selDivs, curDiv, labelEl, color, curRow: cur.row, curCol: cur.column });
+}
+
+function positionLabel(labelEl, row, col) {
+    const renderer   = editor.renderer;
+    const lineHeight = renderer.lineHeight;
+    const scrollTop  = renderer.getScrollTop();
+    const scrollLeft = renderer.getScrollLeft();
+    const charWidth  = renderer.characterWidth;
+    const gutterW    = renderer.$gutterLayer.gutterWidth || 0;
+
+    labelEl.style.top  = Math.max(0, row * lineHeight - scrollTop - lineHeight) + 'px';
+    labelEl.style.left = Math.max(0, col * charWidth  - scrollLeft + gutterW) + 'px';
+}
+
+function repositionAllOverlays() {
+    const renderer   = editor.renderer;
+    const lineHeight = renderer.lineHeight;
+    const charWidth  = renderer.characterWidth;
+    const scrollTop  = renderer.getScrollTop();
+    const scrollLeft = renderer.getScrollLeft();
+    const gutterW    = renderer.$gutterLayer.gutterWidth || 0;
+
+    for (const [, state] of remoteUsers) {
+        // Cursor
+        if (state.curDiv) {
+            state.curDiv.style.top  = (state.curRow * lineHeight - scrollTop) + 'px';
+            state.curDiv.style.left = (state.curCol * charWidth  - scrollLeft + gutterW) + 'px';
+        }
+        // Selection
+        for (const div of state.selDivs) {
+            const row  = parseInt(div.dataset.row);
+            const sCol = parseInt(div.dataset.sCol);
+            div.style.top  = (row  * lineHeight - scrollTop) + 'px';
+            div.style.left = (sCol * charWidth  - scrollLeft + gutterW) + 'px';
+        }
+        // Label
+        if (state.labelEl) {
+            positionLabel(state.labelEl, state.curRow, state.curCol);
+        }
+    }
+}
+
+function clearRemoteUser(name) {
+    const state = remoteUsers.get(name);
+    if (!state) return;
+    for (const d of state.selDivs) d.remove();
+    if (state.curDiv)  state.curDiv.remove();
+    if (state.labelEl) state.labelEl.remove();
+    remoteUsers.delete(name);
+}
+
+function clearAllRemoteUsers() {
+    for (const name of [...remoteUsers.keys()]) clearRemoteUser(name);
+}
+
+// Reposition overlays on scroll.
+editor.session.on('changeScrollTop',  repositionAllOverlays);
+editor.session.on('changeScrollLeft', repositionAllOverlays);
+
+// ── Send local cursor/selection changes ───────────────────────────────────
+let ignoreCursor   = false;
+let cursorThrottle = null;
+
+function sendCursor() {
+    if (!connectionStatus || !socket || socket.readyState !== WebSocket.OPEN) return;
+    if (ignoreCursor) return;
+    const cur = editor.getCursorPosition();
+    let sel;
+    if (editor.selection.isEmpty()) {
+        sel = { start: { row: cur.row, column: cur.column },
+                end:   { row: cur.row, column: cur.column } };
+    } else {
+        const r = editor.getSelectionRange();
+        sel = { start: { row: r.start.row, column: r.start.column },
+                end:   { row: r.end.row,   column: r.end.column   } };
+    }
+    socket.send(JSON.stringify({
+        type:    'cursor',
+        payload: JSON.stringify({ cursor: cur, selection: sel }),
+        user:    userName,
+        roomId:  roomId
+    }));
+}
+
+editor.selection.on('changeCursor',    () => { clearTimeout(cursorThrottle); cursorThrottle = setTimeout(sendCursor, 50); });
+editor.selection.on('changeSelection', () => { clearTimeout(cursorThrottle); cursorThrottle = setTimeout(sendCursor, 50); });
+
 // ── Submit ────────────────────────────────────────────────────────────────
 async function Submit() {
-    const resultEl = document.getElementById('result');
     resultEl.value = 'Running…';
+    broadcastOutput('Running…');
 
     const lang  = parseInt(document.getElementById('language').value, 10);
-    const input = document.getElementById('input-area').value;
+    const input = inputArea.value;
 
     try {
         const response = await fetch('http://localhost:8080/submit', {
@@ -251,13 +501,18 @@ async function Submit() {
             body:    JSON.stringify({ Name: 'submission', Language: lang, Content: editor.getValue(), Input: input })
         });
         const data = await response.json();
+        let output;
         if (!response.ok) {
-            resultEl.value = 'Error: ' + (data.error || response.statusText);
+            output = 'Error: ' + (data.error || response.statusText);
         } else {
-            resultEl.value = data.Output !== undefined ? (data.Output || '(no output)') : JSON.stringify(data);
+            output = data.Output !== undefined ? (data.Output || '(no output)') : JSON.stringify(data);
         }
+        resultEl.value = output;
+        broadcastOutput(output);
     } catch (e) {
-        resultEl.value = 'Request failed: ' + e.message;
+        const errMsg = 'Request failed: ' + e.message;
+        resultEl.value = errMsg;
+        broadcastOutput(errMsg);
     }
 }
 </script>

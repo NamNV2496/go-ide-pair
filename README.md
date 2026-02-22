@@ -10,6 +10,12 @@
 - run cmd `go run main.go`
 - start FE `cd web` and `start index.html` 
 
+With docker 4.+
+run this command
+```bash
+sudo ln -sf ~/.docker/run/docker.sock /var/run/docker.sock
+```
+
 # Demonstration
 
 Input name

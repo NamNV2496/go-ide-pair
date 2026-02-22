@@ -64,6 +64,8 @@ func HandleConnections(w http.ResponseWriter, r *http.Request) {
 			clientsMu.Lock()
 			delete(clients, ws)
 			clientsMu.Unlock()
+			// Notify remaining room members that this user left.
+			broadcast <- Message{Type: "user_left", User: username, RoomID: roomID}
 			break
 		}
 		// Overwrite user/room from the authenticated query params — never trust the client fields.
@@ -86,6 +88,8 @@ func HandleMessages() {
 				}
 			}
 			clientsMu.Unlock()
+			// Notify remaining room members that this user left.
+			broadcast <- Message{Type: "user_left", User: msg.User, RoomID: msg.RoomID}
 			continue
 		}
 
